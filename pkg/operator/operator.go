@@ -17,6 +17,8 @@ package operator
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -112,6 +114,12 @@ type Options struct {
 	// Namespace to which the operator looks for user-specified configuration
 	// data, like Secrets and ConfigMaps.
 	PublicNamespace string
+	// KeyFile specifies the path to the client TLS key for the webhook server
+	KeyFile string
+	// CertFile specifies the path to the client TLS cert for the webhook server
+	CertFile string
+	// ClientCAFile is the path to the CA used by webhook clients to establish trust with the webhook server
+	ClientCAFile string
 	// Certificate of the server in base 64.
 	TLSCert string
 	// Key of the server in base 64.
@@ -169,11 +177,6 @@ func NewScheme() (*runtime.Scheme, error) {
 func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator, error) {
 	if err := opts.defaultAndValidate(logger); err != nil {
 		return nil, fmt.Errorf("invalid options: %w", err)
-	}
-	// Create temporary directory to store webhook serving cert files.
-	certDir, err := os.MkdirTemp("", "operator-cert")
-	if err != nil {
-		return nil, fmt.Errorf("create temporary certificate dir: %w", err)
 	}
 
 	sc, err := NewScheme()
@@ -256,7 +259,56 @@ func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator
 					},
 				}})
 		}),
-		CertDir: certDir,
+		TLSOpts: []func(*tls.Config){
+			func(c *tls.Config) {
+				var ca *x509.Certificate
+				rawCA, err := os.ReadFile(opts.ClientCAFile)
+				if err != nil {
+					if opts.CACert != "" {
+						var decErr error
+						rawCA, decErr = base64.StdEncoding.DecodeString(opts.CACert)
+						if decErr != nil {
+							logger.Error(decErr, "unable to decode CA Cert argument")
+							return
+						}
+					} else {
+						logger.Error(err, "unable to read client CA for webhook server, skipping")
+						return
+					}
+				}
+				ca, err = x509.ParseCertificate(rawCA)
+				if err != nil {
+					logger.Error(err, "unable to parse client CA for webhook server, skipping")
+					return
+				}
+				c.ClientCAs.AddCert(ca)
+			},
+			func(c *tls.Config) {
+				cert, err := tls.LoadX509KeyPair(opts.CertFile, opts.KeyFile)
+				if err != nil {
+					if opts.TLSCert != "" && opts.TLSKey != "" {
+						tlsCert, decErr := base64.StdEncoding.DecodeString(opts.TLSCert)
+						if decErr != nil {
+							logger.Error(decErr, "unable to decode TLS Cert")
+						}
+						tlsKey, decErr := base64.StdEncoding.DecodeString(opts.TLSKey)
+						if decErr != nil {
+							logger.Error(decErr, "unable to decode TLS Key")
+						}
+
+						var tlsErr error
+						cert, tlsErr = tls.X509KeyPair(tlsCert, tlsKey)
+						if tlsErr != nil {
+							logger.Error(tlsErr, "invalid cert or key provided")
+						}
+					} else {
+						logger.Error(err, "unable to load TLS certificate/key pair for webhook server, skipping")
+						return
+					}
+				}
+				c.Certificates = []tls.Certificate{cert}
+			},
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create controller manager: %w", err)
@@ -454,6 +506,9 @@ func (o *Operator) ensureCerts(ctx context.Context, dir string) ([]byte, error) 
 		crt, key, caData []byte
 		err              error
 	)
+	if fileExists(o.opts.CertFile) && fileExists(o.opts.KeyFile) && fileExists(o.opts.ClientCAFile) {
+		return os.ReadFile(o.opts.ClientCAFile)
+	}
 	if o.opts.TLSKey != "" && o.opts.TLSCert != "" {
 		crt, err = base64.StdEncoding.DecodeString(o.opts.TLSCert)
 		if err != nil {
@@ -493,6 +548,14 @@ func (o *Operator) ensureCerts(ctx context.Context, dir string) ([]byte, error) 
 		return nil, fmt.Errorf("create key file: %w", err)
 	}
 	return caData, nil
+}
+
+func fileExists(f string) bool {
+	_, err := os.Stat(f)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
 // namespacedNamePredicate is an event filter predicate that only allows events with
